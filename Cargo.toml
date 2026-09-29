@@ -25,7 +25,7 @@ roxmltree = "0.21"
 # so naming it here adds no crate to the dependency graph. The crate's no-serde
 # stance is unchanged: `[dbc]` is navigated as a `toml::Table`, never derived.
 toml = "1"
-m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.13.0" }
+m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.14.0" }
 
 [profile.release]
 opt-level = 3
