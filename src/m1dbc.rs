@@ -75,12 +75,16 @@ pub struct SourceCounts {
 /// A CAN frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct M1Message {
+    /// Exact M1 component path from `Name`, before DBC-writer sanitisation.
+    pub source_path: String,
     /// DBC identifier: the MoTeC name with the file prefix stripped, sanitized.
     pub name: String,
     /// `CANId`, parsed from hexadecimal.
     pub frame_id: u32,
     /// `IdType="Extended"` — a 29-bit rather than 11-bit identifier.
     pub is_extended: bool,
+    /// Effective source frame format (`Standard` when `IdType` is absent).
+    pub id_type: String,
     /// `DLC`, parsed from **decimal**: the frame's length in bytes.
     pub dlc: u8,
     /// The transmitting node, or `Vector__XXX` when the file names none.
@@ -92,8 +96,12 @@ pub struct M1Message {
 /// A signal within a frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct M1Signal {
+    /// Exact M1 component path from `Name`, before DBC-writer sanitisation.
+    pub source_path: String,
     /// DBC identifier: the segment after the last `.`, sanitized.
     pub name: String,
+    /// Effective raw M1 type (`u32` when `Type` is absent or empty).
+    pub raw_type: String,
     /// `StartBit`, parsed from hexadecimal.
     pub start_bit: u16,
     /// Width in bits, parsed from hexadecimal — always 1 for a `bool`.
@@ -149,10 +157,18 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
     // stream under `<DBC>`, where the two agree; the difference shows only on
     // hand-written input — including this module's own bare-root test fixtures,
     // which is what the wider rule buys.
-    let components: Vec<roxmltree::Node<'_, '_>> = doc
+    let lists: Vec<roxmltree::Node<'_, '_>> = doc
         .descendants()
         .filter(|n| n.has_tag_name("ComponentStream"))
         .flat_map(|cs| cs.children().filter(|n| n.has_tag_name("List")))
+        .collect();
+    if lists.is_empty() {
+        return Err(ExportError::Invalid(
+            "missing ComponentStream/List database structure".to_string(),
+        ));
+    }
+    let components: Vec<_> = lists
+        .into_iter()
         .flat_map(|list| list.children().filter(|n| n.has_tag_name("Component")))
         .collect();
 
@@ -161,29 +177,50 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
     let mut messages: Vec<(String, M1Message)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut signals: HashMap<String, Vec<M1Signal>> = HashMap::new();
-    let mut skipped: Vec<String> = Vec::new();
+    let mut skipped: Vec<(usize, String)> = Vec::new();
 
-    for comp in &components {
+    for (position, comp) in components.iter().enumerate() {
         let classname = comp.attribute("Classname").unwrap_or_default();
         let name = comp.attribute("Name").unwrap_or_default();
 
         if classname == MSG_CLASS {
             if name.ends_with(INDEPENDENT_SIG_MSG_SUFFIX) {
-                skipped.push(format!(
-                    "message '{name}' (VECTOR independent-signal container; \
+                skipped.push((
+                    position,
+                    format!(
+                        "message '{name}' (VECTOR independent-signal container; \
                      not representable by cantools, discarded on DBC load)"
+                    ),
                 ));
                 continue;
             }
             let props = props_of(*comp, "message", name)?;
             let Some(can_id) = props.attribute("CANId") else {
-                skipped.push(format!("message '{name}' (no CANId)"));
+                skipped.push((position, format!("message '{name}' (no CANId)")));
                 continue;
             };
+            let id_type = props.attribute("IdType").unwrap_or("Standard");
+            let maximum = match id_type {
+                "Standard" => 0x7ff,
+                "Extended" => 0x1fffffff,
+                _ => {
+                    return Err(ExportError::Invalid(format!(
+                        "message '{name}': unsupported IdType `{id_type}`"
+                    )));
+                }
+            };
+            let frame_id: u32 = parse_hex(can_id, "message", name, "CANId")?;
+            if frame_id > maximum {
+                return Err(ExportError::Invalid(format!(
+                    "message '{name}': CANId 0x{frame_id:X}, outside the {id_type} identifier range 0x0..=0x{maximum:X}"
+                )));
+            }
             let message = M1Message {
+                source_path: name.to_string(),
                 name: sanitize(message_local_name(name, file_stem), file_stem),
-                frame_id: parse_hex(can_id, "message", name, "CANId")?,
-                is_extended: props.attribute("IdType").unwrap_or("Standard") == "Extended",
+                frame_id,
+                is_extended: id_type == "Extended",
+                id_type: id_type.to_string(),
                 dlc: parse_dec(
                     props.attribute("DLC").unwrap_or("8"),
                     "message",
@@ -206,8 +243,9 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
         } else if classname == SIG_CLASS {
             let parent = parent_name(name);
             if parent.ends_with(INDEPENDENT_SIG_MSG_SUFFIX) {
-                skipped.push(format!(
-                    "signal '{name}' (in VECTOR independent-signal container)"
+                skipped.push((
+                    position,
+                    format!("signal '{name}' (in VECTOR independent-signal container)"),
                 ));
                 continue;
             }
@@ -222,7 +260,7 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
             } else {
                 classname
             };
-            skipped.push(format!("{what} '{name}' (not a CAN frame)"));
+            skipped.push((position, format!("{what} '{name}' (not a CAN frame)")));
         }
     }
 
@@ -235,6 +273,30 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
             m
         })
         .collect();
+    let mut orphan_signal_paths: Vec<String> = signals
+        .into_values()
+        .flatten()
+        .map(|signal| signal.source_path)
+        .collect();
+    orphan_signal_paths.sort();
+    for (position, comp) in components.iter().enumerate() {
+        let name = comp.attribute("Name").unwrap_or_default();
+        if comp.attribute("Classname") == Some(SIG_CLASS)
+            && orphan_signal_paths
+                .binary_search_by(|path| path.as_str().cmp(name))
+                .is_ok()
+        {
+            skipped.push((
+                position,
+                format!(
+                    "signal '{name}' (no convertible parent message '{}')",
+                    parent_name(name)
+                ),
+            ));
+        }
+    }
+    skipped.sort_by_key(|(position, _)| *position);
+    let skipped = skipped.into_iter().map(|(_, note)| note).collect();
 
     let totals = count_source(&components);
     Ok(M1DbcFile {
@@ -300,6 +362,14 @@ fn build_signal(comp: roxmltree::Node<'_, '_>, file_stem: &str) -> Result<M1Sign
     // ignores `Length` entirely.
     let sig_type = props.attribute("Type").unwrap_or_default().trim();
     let sig_type = if sig_type.is_empty() { "u32" } else { sig_type };
+    if !matches!(
+        sig_type,
+        "bool" | "u8" | "u16" | "u32" | "u64" | "s8" | "s16" | "s32" | "s64" | "f32" | "f64"
+    ) {
+        return Err(ExportError::Invalid(format!(
+            "signal '{full_name}': unsupported Type `{sig_type}`"
+        )));
+    }
     let (length, is_signed, is_float) = if sig_type == "bool" {
         (1, false, false)
     } else {
@@ -320,9 +390,16 @@ fn build_signal(comp: roxmltree::Node<'_, '_>, file_stem: &str) -> Result<M1Sign
     let endian = non_empty(props.attribute("Endian"))
         .or_else(|| non_empty(comp.attribute("Endian")))
         .unwrap_or("Little");
+    if !matches!(endian, "Little" | "Big") {
+        return Err(ExportError::Invalid(format!(
+            "signal '{full_name}': unsupported Endian `{endian}`"
+        )));
+    }
 
     Ok(M1Signal {
+        source_path: full_name.to_string(),
         name: sanitize(signal_local_name(full_name), file_stem),
+        raw_type: sig_type.to_string(),
         start_bit: parse_hex(
             props.attribute("StartBit").unwrap_or("0"),
             "signal",
@@ -394,9 +471,17 @@ fn parse_float(
 ) -> Result<f64, ExportError> {
     match raw {
         None => Ok(default),
-        Some(v) => v.trim().parse().map_err(|_| {
-            ExportError::Invalid(format!("signal '{name}': {attr} {v:?} is not a number"))
-        }),
+        Some(v) => {
+            let value: f64 = v.trim().parse().map_err(|_| {
+                ExportError::Invalid(format!("signal '{name}': {attr} {v:?} is not a number"))
+            })?;
+            if !value.is_finite() {
+                return Err(ExportError::Invalid(format!(
+                    "signal '{name}': {attr} {v:?} is not a finite number"
+                )));
+            }
+            Ok(value)
+        }
     }
 }
 
@@ -519,6 +604,7 @@ mod tests {
         let f = sample();
         assert_eq!(f.messages.len(), 1, "messages: {:?}", f.messages);
         let m = &f.messages[0];
+        assert_eq!(m.source_path, "Sample DBC.Status");
         assert_eq!(
             m.name, "Status",
             "file prefix must be stripped and sanitized"
@@ -529,6 +615,7 @@ mod tests {
             "IdType=\"Standard\" is not an extended frame"
         );
         assert_eq!(m.dlc, 8, "DLC is decimal");
+        assert_eq!(m.id_type, "Standard");
         assert_eq!(
             m.sender, "ECU",
             "Sender lives on the Component, not the Props"
@@ -542,6 +629,7 @@ mod tests {
         assert_eq!(sigs.len(), 2, "signals: {sigs:?}");
 
         let yaw = &sigs[0];
+        assert_eq!(yaw.source_path, "Sample DBC.Status.Yaw Rate");
         assert_eq!(
             yaw.name, "Yaw_Rate",
             "signal name is the segment after the last '.'"
@@ -549,6 +637,7 @@ mod tests {
         assert_eq!(yaw.start_bit, 0);
         assert_eq!(yaw.length, 16, "Length=\"10\" is hexadecimal");
         assert!(yaw.little_endian, "Endian defaults to Little");
+        assert_eq!(yaw.raw_type, "s16");
         assert!(yaw.is_signed, "Type=\"s16\" starts with 's'");
         assert!(!yaw.is_float);
         assert_eq!(yaw.scale, 0.5);
@@ -680,6 +769,7 @@ mod tests {
         assert!(!a.is_signed, "Type=\"\" falls back to u32");
         assert!(!a.is_float);
         assert!(!a.little_endian, "Props Endian=\"Big\"");
+        assert_eq!(a.raw_type, "u32", "an empty Type takes the u32 default");
         assert_eq!(a.receiver, "Logger");
 
         let b = &m.signals[1];
@@ -701,10 +791,32 @@ mod tests {
 </List></ComponentStream>"#;
         let f = parse_m1dbc(xml.as_bytes(), "Mod").expect("must parse");
         assert!(f.messages.is_empty());
+        assert_eq!(
+            f.skipped,
+            ["signal 'Mod.Ghost.Sig' (no convertible parent message 'Mod.Ghost')"]
+        );
         assert_eq!(f.totals.total_signals, 1);
         assert_eq!(
             f.totals.convertible_signals, 0,
             "a signal with no surviving parent message is never written"
+        );
+    }
+
+    #[test]
+    fn skipped_orphans_and_metadata_keep_document_order() {
+        let xml = r#"<ComponentStream><List>
+<Component Classname="BuiltIn.CAN.Signal" Name="Mod.Ghost.Z"><Props/></Component>
+<Component Classname="BuiltIn.CAN.DBC" Name="Mod"/>
+<Component Classname="BuiltIn.CAN.Signal" Name="Mod.Ghost.A"><Props/></Component>
+</List></ComponentStream>"#;
+        let file = parse_m1dbc(xml.as_bytes(), "Mod").unwrap();
+        assert_eq!(
+            file.skipped,
+            [
+                "signal 'Mod.Ghost.Z' (no convertible parent message 'Mod.Ghost')",
+                "BuiltIn.CAN.DBC 'Mod' (not a CAN frame)",
+                "signal 'Mod.Ghost.A' (no convertible parent message 'Mod.Ghost')",
+            ]
         );
     }
 
