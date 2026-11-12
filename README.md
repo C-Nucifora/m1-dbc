@@ -169,3 +169,18 @@ GPL-3.0-or-later — see [LICENSE](LICENSE).
 Independent, community-built open-source tooling for the MoTeC® M1 script
 language. Not affiliated with, authorised, or endorsed by MoTeC Pty Ltd.
 "MoTeC" and "M1" are trademarks of MoTeC Pty Ltd.
+
+Exports are staged and read back before replacing a destination. A failed
+parse, validation or verification leaves the previous export intact. Export
+validation rejects unknown type, byte-order and frame-format names, invalid
+identifier ranges, non-finite scaling, zero-width or out-of-payload fields,
+float type/width mismatches and ambiguous output names or frame identities.
+The independent readback compares layout, names, scaling, nodes, units and
+float declarations as well as counts. Quoted units are escaped; units with
+control characters or trailing backslashes and unsupported node names are
+rejected with source context. Each node attribute currently names one node.
+
+DLC remains a decimal payload-byte count, including values above eight. Integer
+types may use narrower transmitted fields. Overlapping signal views and the
+legacy last-definition rule for repeated exact message paths remain unchanged.
+Ordinary orphan signals are omitted and named in the skipped report.

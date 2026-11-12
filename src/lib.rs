@@ -17,7 +17,7 @@
 //! contract is its CLI (report text and exit codes), not its internals.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod config;
 mod m1dbc;
@@ -99,19 +99,13 @@ pub fn export(start_dir: &Path, check: bool) -> Outcome {
         }
     };
 
-    // One scratch directory for the whole run under --check: generated output
-    // has to land on a real filesystem so what is verified and compared is a
-    // file that was actually written, not just a string in memory.
-    let scratch = if check {
-        match scratch_dir() {
-            Ok(dir) => Some(dir),
-            Err(e) => {
-                eprintln!("error: {e}");
-                return Outcome::Failed;
-            }
+    // Verify a real candidate file before publishing any replacement.
+    let scratch = match tempfile::Builder::new().prefix("m1-dbc-export-").tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("error: cannot create export staging directory: {e}");
+            return Outcome::Failed;
         }
-    } else {
-        None
     };
 
     let mut outcome = Outcome::Success;
@@ -130,7 +124,8 @@ pub fn export(start_dir: &Path, check: bool) -> Outcome {
             source_stem,
             out_stem,
             root: &config.root,
-            scratch: scratch.as_deref(),
+            scratch: scratch.path(),
+            check,
         };
         outcome = outcome.max(match export_pair(&pair) {
             Ok(o) => o,
@@ -141,11 +136,6 @@ pub fn export(start_dir: &Path, check: bool) -> Outcome {
         });
     }
 
-    if let Some(dir) = &scratch {
-        // Best-effort: a leftover temp directory is untidy, not a failure, and
-        // reporting it would bury the report it followed.
-        let _ = std::fs::remove_dir_all(dir);
-    }
     outcome
 }
 
@@ -163,8 +153,9 @@ struct Pair<'a> {
     /// The repo root, so the report can name paths the way a developer typed
     /// them rather than as long absolute ones.
     root: &'a Path,
-    /// Under `--check`, the directory to generate into instead of `out`.
-    scratch: Option<&'a Path>,
+    /// Private staging directory for the candidate artifact.
+    scratch: &'a Path,
+    check: bool,
 }
 
 /// Export one pair and print its report block.
@@ -179,12 +170,10 @@ fn export_pair(pair: &Pair<'_>) -> Result<Outcome, String> {
     let bytes = std::fs::read(pair.src).map_err(|e| format!("{}: {e}", pair.src.display()))?;
     let file = m1dbc::parse_m1dbc(&bytes, pair.source_stem)
         .map_err(|e| format!("{}: {e}", pair.src.display()))?;
+    writer::validate_export(&file).map_err(|e| format!("{}: {e}", pair.src.display()))?;
     let text = writer::write_dbc(&file);
 
-    let target = match pair.scratch {
-        Some(dir) => dir.join(format!("{}.dbc", pair.out_stem)),
-        None => pair.out.to_path_buf(),
-    };
+    let target = pair.scratch.join(format!("{}.dbc", pair.out_stem));
     write_export(&target, &text)?;
 
     // Read the file back rather than verifying the string that was meant to go
@@ -195,8 +184,9 @@ fn export_pair(pair: &Pair<'_>) -> Result<Outcome, String> {
         file.messages.len(),
         file.messages.iter().map(|m| m.signals.len()).sum::<usize>(),
     );
-    let round_tripped = roundtrip::roundtrip_counts(&written_text)
-        .map_err(|e| format!("{}: {e}", target.display()))?;
+    let parsed = roundtrip::read(&written_text)
+        .map_err(|e| format!("{}: generated export: {e}", pair.src.display()))?;
+    let round_tripped = roundtrip::counts(&parsed);
 
     let totals = file.totals;
     println!("=== {} ===", pair.out_stem);
@@ -237,7 +227,15 @@ fn export_pair(pair: &Pair<'_>) -> Result<Outcome, String> {
         outcome = Outcome::Mismatch;
     }
 
-    if pair.scratch.is_some() {
+    if let Err(error) = roundtrip::verify(&parsed, &file) {
+        println!("  !! round-trip semantic mismatch: {error}");
+        outcome = Outcome::Mismatch;
+    }
+    if outcome != Outcome::Success {
+        return Ok(outcome);
+    }
+
+    if pair.check {
         // A committed export that does not exist yet compares as empty, so the
         // first run in a repo reports "out of sync" rather than failing.
         //
@@ -264,6 +262,9 @@ fn export_pair(pair: &Pair<'_>) -> Result<Outcome, String> {
         }
     }
 
+    if !pair.check && outcome == Outcome::Success {
+        write_export(pair.out, &written_text)?;
+    }
     Ok(outcome)
 }
 
@@ -279,17 +280,6 @@ fn write_export(path: &Path, text: &str) -> Result<(), String> {
     }
     m1_workspace::atomic_write(path, text.as_bytes())
         .map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// A fresh directory under the system temp dir for one `--check` run.
-fn scratch_dir() -> Result<PathBuf, String> {
-    let mut dir = std::env::temp_dir();
-    dir.push(format!("m1-dbc-export-{}", std::process::id()));
-    // Left over from a crashed run with the same pid: start from nothing so a
-    // stale file can never be read back as this run's output.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    Ok(dir)
 }
 
 /// Collapse CRLF and CR to LF so a committed export stored with Windows line

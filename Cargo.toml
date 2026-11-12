@@ -17,6 +17,7 @@ name = "m1_dbc"
 path = "src/lib.rs"
 
 [dependencies]
+tempfile = "3"
 can-dbc = { version = "10", default-features = false }
 clap = { version = "4", features = ["derive"] }
 roxmltree = "0.21"
